@@ -1,0 +1,182 @@
+// Personal cash-flow ledger.
+//
+// Conventions
+// - Reporting currency is Israeli Shekels (ILS, ₪). Every row that feeds a
+//   monthly total stores a final ILS figure (`netAmountIls` / `amountIls`).
+// - Money is stored as DECIMAL, never float.
+// - Transaction dates are calendar dates (`@db.Date`), no time-of-day, so a
+//   payment always lands in the month it was made regardless of timezone.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────── Enums ───────────────────────────────
+
+enum InflowType {
+  RENT // rental income from a Property (scaled by ownership share)
+  PENSION // UK pension paid in GBP, converted to ILS
+  OTHER // anything else, entered directly in ILS
+}
+
+enum CategoryTier {
+  FIXED_BASELINE // predictable monthly commitments
+  VARIABLE_LIFESTYLE // discretionary spending that changes month to month
+}
+
+/// Where a ledger row came from. Shared by inflows and outflows.
+enum EntrySource {
+  RECURRING_RULE // auto-posted from a template / expected-income rule
+  MANUAL // typed in by hand
+  STATEMENT_IMPORT // imported from a bank or card statement
+}
+
+// ───────────────────────────── Reference data ─────────────────────────────
+
+/// A rental property. Rent is recorded at 100% (gross) on each Inflow and
+/// scaled by the ownership share to get the family's portion.
+model Property {
+  id                     String   @id @default(cuid())
+  name                   String   @unique
+  address                String?
+  /// 1.0000 = fully owned, 0.7000 = 70% share.
+  ownershipShare         Decimal  @default(1) @db.Decimal(5, 4)
+  /// Expected full monthly rent (100% of the property) in ILS. Used to
+  /// auto-post the expected rent each month; null = never auto-post.
+  expectedMonthlyRentIls Decimal? @db.Decimal(12, 2)
+  /// Day of month rent normally arrives (1–28).
+  rentDayOfMonth         Int      @default(1)
+  active                 Boolean  @default(true)
+  notes                  String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  inflows Inflow[]
+}
+
+/// A UK pension paid in GBP into a UK bank account.
+model Pension {
+  id                  String   @id @default(cuid())
+  name                String   @unique
+  provider            String?
+  /// Expected monthly payment in GBP; null = never auto-post.
+  expectedMonthlyGbp  Decimal? @db.Decimal(12, 2)
+  /// Default GBP→ILS rate used when auto-posting. Update it as the rate moves;
+  /// each Inflow keeps the rate actually used, so history never changes.
+  defaultExchangeRate Decimal? @db.Decimal(10, 6)
+  paymentDayOfMonth   Int      @default(1)
+  active              Boolean  @default(true)
+  notes               String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  inflows Inflow[]
+}
+
+model Category {
+  id        String       @id @default(cuid())
+  name      String       @unique
+  tier      CategoryTier
+  sortOrder Int          @default(0)
+  active    Boolean      @default(true)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  outflows           Outflow[]
+  recurringTemplates RecurringTemplate[]
+
+  @@index([tier, sortOrder])
+}
+
+/// A default monthly fixed cost that is auto-posted as an Outflow each month.
+model RecurringTemplate {
+  id          String    @id @default(cuid())
+  name        String    @unique
+  categoryId  String
+  amountIls   Decimal   @db.Decimal(12, 2)
+  /// Day of month the Outflow is dated (1–28 so every month has it).
+  dayOfMonth  Int       @default(1)
+  description String?
+  active      Boolean   @default(true)
+  /// First month the template applies (any date inside that month).
+  startDate   DateTime  @default(now()) @db.Date
+  /// Last month the template applies; null = open-ended.
+  endDate     DateTime? @db.Date
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  category Category  @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  outflows Outflow[]
+
+  @@index([active])
+}
+
+// ─────────────────────────────── Ledger ───────────────────────────────
+
+/// Money coming in.
+///
+/// RENT:    netAmountIls = grossAmountIls × ownershipShare
+/// PENSION: netAmountIls = amountGbp × exchangeRate
+/// OTHER:   netAmountIls = grossAmountIls
+///
+/// Inputs are kept alongside the result (and the share is snapshotted) so a
+/// later change to a property's share or the exchange rate never rewrites
+/// past months. Always build rows with `lib/inflow-math.ts`.
+model Inflow {
+  id     String      @id @default(cuid())
+  type   InflowType
+  date   DateTime    @db.Date
+  source EntrySource @default(MANUAL)
+
+  propertyId     String?
+  /// Full (100%) rent received for the property, in ILS.
+  grossAmountIls Decimal? @db.Decimal(12, 2)
+  /// Ownership share at the time of the payment.
+  ownershipShare Decimal? @db.Decimal(5, 4)
+
+  pensionId    String?
+  amountGbp    Decimal? @db.Decimal(12, 2)
+  /// ILS per 1 GBP.
+  exchangeRate Decimal? @db.Decimal(10, 6)
+
+  /// Final amount counted in the monthly totals.
+  netAmountIls Decimal @db.Decimal(12, 2)
+
+  notes      String?
+  /// Idempotency key for auto-posted rows, e.g. "property:<id>:2026-11".
+  postingKey String?  @unique
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  property Property? @relation(fields: [propertyId], references: [id], onDelete: Restrict)
+  pension  Pension?  @relation(fields: [pensionId], references: [id], onDelete: Restrict)
+
+  @@index([date])
+  @@index([type, date])
+}
+
+/// Money going out.
+model Outflow {
+  id                  String      @id @default(cuid())
+  categoryId          String
+  amountIls           Decimal     @db.Decimal(12, 2)
+  date                DateTime    @db.Date
+  description         String?
+  source              EntrySource @default(MANUAL)
+  recurringTemplateId String?
+  /// Idempotency key for auto-posted rows, e.g. "template:<id>:2026-11".
+  postingKey          String?     @unique
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+
+  category          Category           @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  recurringTemplate RecurringTemplate? @relation(fields: [recurringTemplateId], references: [id], onDelete: SetNull)
+
+  @@index([date])
+  @@index([categoryId, date])
+}
