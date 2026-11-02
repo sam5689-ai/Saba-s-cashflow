@@ -49,9 +49,25 @@ Other scripts: `npm run typecheck`, `npm run lint`, `npm run build`, `npm run db
 
 ## Railway
 
-1. Add a PostgreSQL service and set the app's `DATABASE_URL` to reference it. Also set `CRON_SECRET`.
-2. Build command: `npm run build`. Pre-deploy command: `npm run db:deploy`. Start command: `npm start`.
-3. Seed once with `railway run npm run db:seed`.
+One project with three services: **Postgres**, **web** (this repo), and **cron** (this repo again, running on a schedule).
+
+| Service | Setting | Value |
+| --- | --- | --- |
+| web | Variables | `DATABASE_URL=${{Postgres.DATABASE_URL}}`, `CRON_SECRET=<long random string>` |
+| web | Pre-deploy command | `npm run db:deploy` |
+| web | Start command | `npm start` (default) |
+| web | Networking | Generate a public domain |
+| cron | Variables | `APP_URL=https://${{web.RAILWAY_PUBLIC_DOMAIN}}`, `CRON_SECRET=${{web.CRON_SECRET}}` |
+| cron | Start command | `npm run cron:post-recurring` |
+| cron | Cron schedule | `0 6 * * *` (daily, 06:00 UTC; safe because posting skips existing rows) |
+
+Seed the production database **once**, from your own machine, after editing the real figures in `prisma/seed.ts`. The internal `DATABASE_URL` only works inside Railway, so use the Postgres service's `DATABASE_PUBLIC_URL`:
+
+```bash
+DATABASE_URL="<DATABASE_PUBLIC_URL from Railway>" npm run db:seed
+```
+
+Re-running the seed overwrites property, pension and template figures with the values in `seed.ts`, so treat that file as the source of truth.
 
 ## Layout
 
